@@ -1,70 +1,74 @@
-def classify(self, image_path):
-    """Run classification on an image"""
+    # --- after preprocessing and initial shape handling ---
+    # ensure input_data is numpy uint8
+    input_data = np.asarray(input_data, dtype=np.uint8)
 
-    # Get input info from the configured network group
-    input_infos = self.network_group.get_input_vstream_infos()
-    input_info = input_infos[0]
-    input_shape = input_info.shape                  # e.g. (224,224,3) or (1,224,224,3)
-    input_name = input_info.name
-    print(f"\nModel expects input shape: {input_shape}, input name: {input_name}")
-
-    # Determine target size (height, width)
-    if len(input_shape) == 4:   # NHWC (batch, H, W, C)
-        target_size = (input_shape[1], input_shape[2])
-    elif len(input_shape) == 3: # HWC
-        target_size = (input_shape[0], input_shape[1])
-    else:
-        target_size = (224, 224)
-
-    # Preprocess image (returns uint8 HWC)
-    input_data = self.preprocess_image(image_path, target_size)
-    input_data = input_data.astype(np.uint8)
-
-    # Add batch dimension if model expects one
-    if len(input_shape) == 4 and len(input_data.shape) == 3:
+    # ensure batch dim exists
+    if input_data.ndim == 3:
+        # H,W,C  -> add batch
         input_data = np.expand_dims(input_data, axis=0)
 
-    print(f"Final input shape before batching: {input_data.shape}, dtype: {input_data.dtype}")
+    # Desired per-frame shape (H,W,C)
+    if len(input_shape) == 4:   # network shape is (N,H,W,C)
+        H, W, C = input_shape[1], input_shape[2], input_shape[3]
+    elif len(input_shape) == 3: # network shape is (H,W,C)
+        H, W, C = input_shape[0], input_shape[1], input_shape[2]
+    else:
+        raise RuntimeError(f"Unsupported input_shape: {input_shape}")
 
-    # determine expected frame count (some HEFs expect many frames packed)
-    expected_frame_count = None
-    # try to read a size/frames field if available
-    frame_count_attr = None
-    if hasattr(input_info, "size") and input_info.size is not None:
-        # input_info.size is total bytes for vstream; compute frames if possible
-        single_frame_elems = int(np.prod(input_shape[-3:]))  # H*W*C
-        try:
-            expected_frame_count = int(input_info.size // single_frame_elems)
-            frame_count_attr = "size"
-        except Exception:
-            expected_frame_count = None
+    # If data shape doesn't match (N,H,W,C), try common permutations
+    n, h, w, c = input_data.shape
+    if (h, w, c) != (H, W, C):
+        # maybe data is N,C,H,W -> transpose
+        if (h, w, c) == (C, H, W):
+            input_data = np.transpose(input_data, (0, 2, 3, 1))
+            n, h, w, c = input_data.shape
+            print("[INFO] Transposed NCHW -> NHWC")
+        # maybe data is N, H, C (rare) or other mismatch - try more attempts:
+        elif (h, w, c) == (H, C, W):
+            input_data = np.transpose(input_data, (0, 1, 3, 2))
+            n, h, w, c = input_data.shape
+            print("[INFO] Minor transpose applied")
+        else:
+            # Print diagnostics and raise so we don't send wrong-sized buffer
+            print(f"[ERROR] Input data shape after attempts: {input_data.shape}; expected per-frame (H,W,C)=({H},{W},{C})")
+            raise RuntimeError("Input data layout doesn't match model input. See diagnostic print above.")
 
-    # Fallback: try a common attribute if present
-    if expected_frame_count is None:
-        if hasattr(input_info, "frame_count"):
-            expected_frame_count = int(getattr(input_info, "frame_count"))
-            frame_count_attr = "frame_count"
+    # compute expected elements per frame and frames
+    elems_per_frame = H * W * C
 
-    # final fallback -> assume batch 1
-    if expected_frame_count is None:
-        expected_frame_count = 1
+    # The input vstream may have a specific frame_count/size. Try to infer:
+    expected_frame_count = 1
+    if hasattr(input_info, "frame_count") and input_info.frame_count:
+        expected_frame_count = int(input_info.frame_count)
+    elif hasattr(input_info, "size") and input_info.size:
+        # input_info.size is bytes for vstream; compute frames if possible
+        # size is total bytes, elems_per_frame elements => frames = size / elems_per_frame
+        expected_frame_count = int(input_info.size // elems_per_frame)
 
-    print(f"[DEBUG] expected_frame_count (from {frame_count_attr or 'fallback'}): {expected_frame_count}")
-
-    # Repeat the single image to match expected batch/frame count if needed
+    # If python-side batch != expected_frame_count, repeat the frames properly
     if input_data.shape[0] != expected_frame_count:
         if input_data.shape[0] == 1:
             input_data = np.repeat(input_data, expected_frame_count, axis=0)
-            print(f"Repeated input to match expected frames. New shape: {input_data.shape}")
+            print(f"[INFO] Repeated single image to match expected_frame_count={expected_frame_count}")
         else:
-            # If user supplied more than 1 frame but not expected_frame_count, try to tile/truncate
+            # tile/truncate to match expected_frame_count
             if input_data.shape[0] < expected_frame_count:
-                input_data = np.repeat(input_data, int(np.ceil(expected_frame_count / input_data.shape[0])), axis=0)
-                input_data = input_data[:expected_frame_count]
+                reps = int(np.ceil(expected_frame_count / input_data.shape[0]))
+                input_data = np.repeat(input_data, reps, axis=0)[:expected_frame_count]
             else:
                 input_data = input_data[:expected_frame_count]
 
-    # Prepare input dictionary (handle dict/list param types)
+    # Make memory contiguous and correct dtype
+    input_data = np.ascontiguousarray(input_data, dtype=np.uint8)
+
+    # Final sanity check
+    final_size = input_data.size  # total elements across batch
+    expected_total = expected_frame_count * elems_per_frame
+    print(f"[DEBUG] final input shape: {input_data.shape}, dtype: {input_data.dtype}, elements: {final_size}; expected elements: {expected_total}")
+    if final_size != expected_total:
+        raise RuntimeError(f"Final buffer element count mismatch: expected {expected_total} got {final_size}")
+
+    # Build the dictionary correctly (use input_data)
     if isinstance(self.input_vstreams_params, dict):
         input_name = list(self.input_vstreams_params.keys())[0]
     else:
@@ -72,33 +76,3 @@ def classify(self, image_path):
         input_name = getattr(param, "name", param)
 
     input_dict = {input_name: input_data}
-    print(f"Final input shape after batching: {input_data.shape} -> building input_dict with key: {input_name}")
-
-    # Activate network group with context manager, then create/use InferVStreams
-    print("Activating network group and running inference...")
-    import time
-    start_time = time.time()
-
-    # Use activate() as a context manager — ensures activation lives for the duration
-    # (some HailoRT versions require being in the same context when using vstreams)
-    with self.network_group.activate():
-        with InferVStreams(self.network_group,
-                          self.input_vstreams_params,
-                          self.output_vstreams_params) as infer_pipeline:
-            output_dict = infer_pipeline.infer(input_dict)
-
-    inference_time = (time.time() - start_time) * 1000
-    print(f"✓ Inference completed in {inference_time:.2f} ms")
-
-    # Process output
-    output_name = list(output_dict.keys())[0]
-    output_data = output_dict[output_name]
-
-    print(f"\nOutput shape: {output_data.shape}")
-    print(f"Output dtype: {output_data.dtype}")
-
-    # Flatten and softmax
-    predictions = output_data.flatten()
-    predictions = self.softmax(predictions)
-
-    return predictions
